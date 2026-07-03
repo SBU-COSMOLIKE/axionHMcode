@@ -468,6 +468,25 @@ the dome cost drops from ~135 s (upstream) to ~17 s, before the boost
 theory's `processes` fork-parallelism divides the wall time (default:
 one worker per `OMP_NUM_THREADS` core).
 
+The outsized LCDM-limit ratio deserves a note, because it looks anomalous.
+Profiled, upstream's LCDM path spends ~75% of its time in one
+`scipy.integrate.dblquad` evaluation of the HMcode-2020 eq. A5 integrated
+growth — 0.15 s to produce a single number (A.3) — and most of the
+remainder in the formation-redshift brentq cascade (A.5); the actual
+halo-model sums cost ~0.01 s. Everything slow on this path is of the
+"re-derive a smooth function from scratch" kind, so nearly all of it
+tabulates away and only the honest halo-model arithmetic remains; on the
+axion path, by contrast, the remaining cost is dominated by the soliton
+central-density solver, which is deliberately not restructured (A.11) —
+that is why the LCDM ratio exceeds the axion-case ratio. The ratio implies
+nothing about Fortran HMcode-2020: that code already tabulates the growth
+and obtains the formation redshift by inverse interpolation — this fork
+imported the Fortran code's structure into the python port (A.2, A.5), not
+a new trick that would transfer back. Note also that the fork times here
+are warm-cache marginal costs: a fresh cosmology pays a one-time ~0.1 s
+growth/G table build per worker process, amortized to ~2 ms per redshift
+over the pipeline's ~50-node grid.
+
 ### A.11 What was deliberately not changed
 
 - The soliton central-density solver still uses `scipy.optimize.root` with

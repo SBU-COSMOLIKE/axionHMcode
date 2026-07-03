@@ -310,8 +310,15 @@ def fftlog_j0_eval(tab, rho, k_targets):
   """I(k_targets) = int rho(r) r^2 j0(k r) dr from the grid machinery of
   fftlog_j0_grid and the profile samples rho(r). Two FFTs plus the analytic
   edge tail and a cubic interpolation in ln k (uniform grid, closed-form
-  4-point Lagrange weights)."""
+  4-point Lagrange weights).
+
+  The transforms go through scipy.fft (pocketfft), measured ~1.5x faster
+  than numpy.fft on this length; pyfftw/FFTW with reused plans would gain
+  another ~2x on the transforms themselves, but the whole FFT share is
+  ~3 ms per redshift (~1% of the evaluation), which does not justify the
+  dependency (benchmark in the strategy notes, 2026-07-03)."""
   from scipy.special import sici
+  from scipy import fft as _sfft
   r, data_bias, ext_bias, kernel, lnk0, dlnr = tab
   n = len(r)
   n_fft = n + len(ext_bias)
@@ -323,8 +330,8 @@ def fftlog_j0_eval(tab, rho, k_targets):
   # the target sum is Re sum_m c_m K_m e^{-2 pi i m j / N} = irfft of
   # conj(c K) up to the 1/N convention; the cached kernel is conj(K), so
   # only the rfft output needs conjugating here
-  b = np.conj(np.fft.rfft(a)) * kernel
-  I_grid = np.fft.irfft(b, n=n_fft)
+  b = np.conj(_sfft.rfft(a)) * kernel
+  I_grid = _sfft.irfft(b, n=n_fft)
   # interpolation window around the targets (slice before the k^-q unbias
   # and the sici tail so both run on ~a few hundred points, not 4096)
   lnk_t = np.log(k_targets)
