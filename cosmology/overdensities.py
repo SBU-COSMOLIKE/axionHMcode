@@ -40,7 +40,45 @@ def func_D_z_unnorm_int(z, Omega_m_0, Omega_w_0):
     integral gwoth of the unmoralised growth function
     as in https://arxiv.org/pdf/2009.01858 eq. A5
     """
-
+    # VM-SPEEDUP BEGINS
+    #
+    # Quantity. This function returns the integrated growth of HMcode-2020
+    # (Mead et al., arXiv:2009.01858, eq. A5),
+    #
+    #   G(z) = (5/2) Omega_m  int_z^{z_max} dx  E(x)/(1+x)
+    #                         int_x^{z_max} dy  (1+y)/E(y)^3 ,
+    #
+    # with z_max = 10^4 and E(z) = H(z)/H0 (the lambda `f` in the retained
+    # upstream code below, with dblquad's (y, x) argument ordering).
+    #
+    # Upstream evaluation. scipy.integrate.dblquad, an adaptive
+    # two-dimensional quadrature, at a measured cost of ~0.15 s per call.
+    # The function is called once per (cosmology, redshift) evaluation to
+    # set cosmo_dic['G_a'], so the cost recurs at every likelihood point.
+    #
+    # Fork evaluation. G is a smooth, monotone function of the single
+    # variable z, and both integrals run from a moving lower limit to the
+    # same fixed upper limit. Defining the inner integral
+    #
+    #   I(x) = int_x^{z_max} dy (1+y)/E(y)^3 ,
+    #
+    # both I(x) and the outer integral of E(x)/(1+x) * I(x) are cumulative
+    # integrals taken from z_max downward, so one dense node grid yields the
+    # whole function G(z) via two reversed cumulative trapezoid sums. The
+    # table is built once per cosmology and interpolated afterwards; see
+    # fast_tables.G_integral_fast for the construction, node layout, and the
+    # accuracy_boost scaling of the node count. The import is done lazily
+    # here because fast_tables imports this module (a top-level import would
+    # be circular).
+    #
+    # Accuracy. Relative agreement with the upstream dblquad evaluation is
+    # <= 1.6e-6 at z in {0, 1, 5, 9.8} (primitive checks in
+    # dev_scripts/fork_validate.py of the AxiECAMB boost package). The
+    # upstream code is kept below, after the return statement, as the
+    # reference implementation.
+    from . import fast_tables
+    return fast_tables.G_integral_fast(z, Omega_m_0, Omega_w_0)
+    # VM-SPEEDUP ENDS
     f = lambda y, x: func_E_z(x, Omega_m_0, Omega_w_0)/(1+x)*(1+y)/func_E_z(y, Omega_m_0, Omega_w_0)**3
     G =  5 * Omega_m_0 / 2 * integrate.dblquad(f, z, 10000, lambda x:x, 10000)[0] # now with Numba trapz
     return G

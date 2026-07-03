@@ -51,3 +51,5 @@ halo_model/__pycache__/PS_nonlin_axion.cpython-310.pyc
 halo_model/__pycache__/PS_nonlin_cold.cpython-310.pyc
 solvers/__pycache__/integrators.cpython-310.pyc
 solvers/__pycache__/root_finders.cpython-310.pyc
+__pycache__/
+*.pyc

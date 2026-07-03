@@ -169,24 +169,89 @@ def func_ax_halo_mass(M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_di
     returns the axion halo mass by integrating the halo
     density profile in units of solar_mass/h
     """
+    # VM-SPEEDUP BEGINS
+    #
+    # Quantity. The axion halo mass by integration of the composed
+    # soliton + NFW axion profile out to the virial radius,
+    #
+    #   M_ax = 4 pi int_0^{r_vir} rho_ax(r) r^2 dr .
+    #
+    # Upstream evaluation. rho_ax was sampled on a 2000-point geomspace
+    # grid in [1e-15, r_vir] and integrated with scipy.integrate.simpson.
+    # This function is the objective of the soliton central-density root
+    # solver (func_central_density_param), which evaluates it ~30 times per
+    # halo mass, so simpson's per-call bookkeeping (~60 us of validation,
+    # slicing and masked divisions per call) recurs ~3000 times per
+    # redshift and dominates the solver's cost.
+    #
+    # Fork evaluation. The identical grid with precomputed quadrature
+    # weights (fast_tables.geom_simpson_grid): the integral becomes the
+    # plain dot product 4 pi sum_i w_i rho_ax(r_i) r_i^2. The weights
+    # implement the canonical unevenly-spaced composite Simpson rule
+    # (parabola pairs, trapezoid on the leftover final interval) — textbook
+    # mathematics with no scipy call in the hot loop and hence no
+    # dependence on scipy's per-version last-interval policy.
+    #
+    # The grid must be upstream's, not a better quadrature's. The profile
+    # composition inside func_dens_profile_ax selects the soliton -> NFW
+    # crossover from sign changes of the sampled difference, so the
+    # composed profile depends on where the nodes fall. A Gauss-Legendre
+    # rewrite in log radius (measured before this design was adopted) is
+    # spectrally accurate on each smooth branch, yet flips the crossover
+    # detection for grazing halos as the node count changes, moving the
+    # final boost non-monotonically at the 1e-3 level — a behavior change
+    # relative to upstream, not a quadrature error. Keeping upstream's
+    # geomspace nodes keeps the composition, the crossover snapping, and
+    # the solver's rejection behavior bit-identical; only the summation
+    # rule applied to the identical samples changes.
+    #
+    # Accuracy. The rule difference from scipy's simpson is confined to the
+    # outermost radial interval (trapezoid here vs scipy >= 1.11's
+    # last-interval parabola) and is orders of magnitude below the fork
+    # validation gate max |dB/B| <= 1e-4 (dev_scripts/fork_validate.py).
+    # The node count is pinned at upstream's 2000 and excluded from the
+    # accuracy_boost scaling: doubling it re-snaps the crossover and flips
+    # marginal rejections, moving the boost by up to ~7e-2 at high k
+    # (measured) — model behavior tied to the released grid, not
+    # quadrature convergence (see fast_tables.geom_simpson_grid).
+    from cosmology import fast_tables
     #distinguish whether M is an array or a scalar
     if isinstance(M, (int, float)) == True:
-        r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'], 
+        r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
+                           cosmo_dic['Omega_w_0'], cosmo_dic['G_a'], cosmo_dic['version'])
+        r_arr, w_arr = fast_tables.geom_simpson_grid(1e-15, r_vir, cosmo_dic)
+        integrand = func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_dic,
+                                         concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic) * r_arr**2
+        return 4 * np.pi * np.dot(w_arr, integrand)
+    else:
+        integral = np.zeros(len(M))
+        for i in range(len(M)):
+            upper_bound = func_r_vir(cosmo_dic['z'], M[i], cosmo_dic['Omega_ax_0'],
+                                     cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
+                                     cosmo_dic['Omega_w_0'], cosmo_dic['G_a'], cosmo_dic['version'])
+            r_arr, w_arr = fast_tables.geom_simpson_grid(1e-15, upper_bound, cosmo_dic)
+            integral[i] = 4 * np.pi * np.dot(w_arr, func_dens_profile_ax(r_arr, M[i], cosmo_dic, power_spec_dic, rho_central_param[i], hmcode_dic,
+                                                                         concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)*r_arr**2)
+
+        return integral
+    # VM-SPEEDUP ENDS (upstream body, kept as the reference implementation)
+    if isinstance(M, (int, float)) == True:
+        r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
                            cosmo_dic['Omega_w_0'], cosmo_dic['G_a'], cosmo_dic['version'])
         r_arr = np.geomspace(1e-15, r_vir, num=2000)
-        integrand = func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_dic, 
+        integrand = func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_dic,
                                          concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic) * r_arr**2
         return 4 * np.pi * integrate.simpson(y=integrand, x = r_arr)
     else:
         integral = np.zeros(len(M))
         for i in range(len(M)):
-            upper_bound = func_r_vir(cosmo_dic['z'], M[i], cosmo_dic['Omega_ax_0'], 
-                                     cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],  
+            upper_bound = func_r_vir(cosmo_dic['z'], M[i], cosmo_dic['Omega_ax_0'],
+                                     cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
                                      cosmo_dic['Omega_w_0'], cosmo_dic['G_a'], cosmo_dic['version'])
             R_int = np.geomspace(1e-15, upper_bound, num=2000)
-            integral[i] = 4 * np.pi * integrate.simpson(y=func_dens_profile_ax(R_int, M[i], cosmo_dic, power_spec_dic, rho_central_param[i], hmcode_dic, 
+            integral[i] = 4 * np.pi * integrate.simpson(y=func_dens_profile_ax(R_int, M[i], cosmo_dic, power_spec_dic, rho_central_param[i], hmcode_dic,
                                                                                concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)*R_int**2, x=R_int)
-            
+
         return integral
         
 
