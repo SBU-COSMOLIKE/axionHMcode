@@ -85,6 +85,24 @@ _FFTLOG_WINDOW = 0.25         # tapered fraction of Fourier modes (the
 # convergence check for every table in this module.
 _ACCURACY_BOOST = 1.0
 
+# solver mode, set from the boost theory's yaml `legacy_root_finder`
+# option (PI decision 2026-07-03: the re-engineered solver is the default;
+# the released code's behavior is kept verbatim behind the flag):
+#   legacy_root_finder = False (default) — the re-engineered soliton
+#     central-density machinery: bracketed brentq root solver with residual
+#     classification, closest-achievable acceptance for unreachable "gap"
+#     targets, per-evaluation diagnostics, and a log-linearly interpolated
+#     soliton/NFW crossover cell (see halo_model/axion_density_profile.py).
+#     Not bit-comparable to upstream; validated by dome-version agreement
+#     (<= 7e-5 in B), attributed basic-version differences, and
+#     posterior-point delta-chi2 postprocessing.
+#   legacy_root_finder = True — bit-faithful to released axionHMcode:
+#     scipy.optimize.root(hybr) with the |guess - rho_c| > 100 acceptance
+#     net and the grid-snapped crossover, verbatim. Kept for upstream
+#     comparison; this is the path the fork_validate gate certifies at
+#     max |dB/B| <= 1e-4 against upstream.
+_LEGACY_SOLVER = False
+
 
 def set_accuracy_boost(boost):
   """Scale all table node counts by `boost` (> 0); tables rebuild lazily."""
@@ -93,6 +111,17 @@ def set_accuracy_boost(boost):
   if not boost > 0:
     raise ValueError(f"accuracy_boost must be > 0, got {boost!r}")
   _ACCURACY_BOOST = boost
+
+
+def set_legacy_root_finder(flag):
+  """Select the default re-engineered solver (False) or the released
+  code's verbatim behavior (True); see the module-level comment."""
+  global _LEGACY_SOLVER
+  _LEGACY_SOLVER = bool(flag)
+
+
+def use_legacy_root_finder():
+  return _LEGACY_SOLVER
 
 
 def _nodes(base):

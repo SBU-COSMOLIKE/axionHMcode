@@ -160,6 +160,64 @@ def func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, rho_central_param,
         return return_arr
                 
         
+# VM-SPEEDUP BEGINS (default solver mode only; see func_central_density_param)
+def _ax_halo_mass_smooth(M, cosmo_dic, power_spec_dic, rho_central_param,
+                             hmcode_dic, concentration_param, eta_given,
+                             axion_dic):
+    """M_ax = 4 pi int rho_ax r^2 dr with the soliton/NFW crossover treated
+    continuously (default solver mode).
+
+    The composition follows upstream's definition — soliton inside the last
+    crossing of the two branches, NFW outside, pure soliton when no node
+    detects a crossing — but the crossing radius r_x is interpolated
+    log-linearly inside its bracketing cell (both branches are locally
+    near power laws, so log NFW - log soliton is nearly linear in ln r),
+    and the cell integral is corrected with a two-piece trapezoid split at
+    r_x. All quantities come from the already computed branch samples: no
+    additional profile evaluations.
+    """
+    from cosmology import fast_tables
+    if concentration_param == True:
+        c_min = hmcode_dic['c_min']
+    else:
+        c_min = 4.
+    r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'],
+                       cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
+                       cosmo_dic['Omega_w_0'], cosmo_dic['G_a'],
+                       cosmo_dic['version'])
+    r_arr, w_arr = fast_tables.geom_simpson_grid(1e-15, r_vir, cosmo_dic)
+    NFW = cosmo_dic['omega_ax_0'] / cosmo_dic['omega_db_0'] * \
+        NFW_profile(M, r_arr, power_spec_dic['k'],
+                    power_spec_dic['power_cold'], cosmo_dic, hmcode_dic,
+                    cosmo_dic['Omega_db_0'], c_min, eta_given=eta_given,
+                    axion_dic=axion_dic)
+    soliton = func_rho_soliton(r_arr, M, cosmo_dic, rho_central_param)
+    idx_arr = np.argwhere(np.diff(np.sign(NFW - soliton))).flatten()
+    if len(idx_arr) <= 0:
+        return 4 * np.pi * np.dot(w_arr, soliton * r_arr**2)
+    i = int(idx_arr[-1])
+    profile = np.where(r_arr > r_arr[i], NFW, soliton)
+    base = np.dot(w_arr, profile * r_arr**2)
+    # log-linear crossing radius inside the bracketing cell (r_i, r_{i+1})
+    d0 = np.log(NFW[i]) - np.log(soliton[i])
+    d1 = np.log(NFW[i + 1]) - np.log(soliton[i + 1])
+    t = d0 / (d0 - d1)
+    r_x = r_arr[i] * (r_arr[i + 1] / r_arr[i])**t
+    # branch value at the crossing (geometric mean of the two log-linear
+    # branch interpolants, which agree there up to interpolation error)
+    lv0 = (1 - t) * np.log(soliton[i]) + t * np.log(soliton[i + 1])
+    lv1 = (1 - t) * np.log(NFW[i]) + t * np.log(NFW[i + 1])
+    v_x = np.exp(0.5 * (lv0 + lv1)) * r_x**2
+    # replace the cell's assigned trapezoid with the split two-piece one
+    f0 = soliton[i] * r_arr[i]**2
+    f1 = NFW[i + 1] * r_arr[i + 1]**2
+    assigned = 0.5 * (r_arr[i + 1] - r_arr[i]) * (f0 + f1)
+    split = (0.5 * (r_x - r_arr[i]) * (f0 + v_x)
+             + 0.5 * (r_arr[i + 1] - r_x) * (v_x + f1))
+    return 4 * np.pi * (base + (split - assigned))
+# VM-SPEEDUP ENDS
+
+
 def func_ax_halo_mass(M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_dic, concentration_param=False, eta_given=False, axion_dic=None):
     """
     M in solar_mass/h
@@ -214,7 +272,25 @@ def func_ax_halo_mass(M, cosmo_dic, power_spec_dic, rho_central_param, hmcode_di
     # marginal rejections, moving the boost by up to ~7e-2 at high k
     # (measured) — model behavior tied to the released grid, not
     # quadrature convergence (see fast_tables.geom_simpson_grid).
+    #
+    # Default solver mode (not fast_tables.use_legacy_root_finder(); see
+    # func_central_density_param for the mode's contract): the same
+    # integral with the soliton/NFW crossover treated continuously — the
+    # crossing radius inside its bracketing cell is located by log-linear
+    # interpolation and the cell's contribution is corrected analytically,
+    # making M_ax a smooth function of the central density instead of one
+    # with node-hopping micro-steps. On the pinned grid those steps are
+    # only O(1e-6) of M_ax, but a smooth objective is what a bracketed
+    # solver deserves. Legacy mode (legacy_root_finder: true) never reaches
+    # this helper.
     from cosmology import fast_tables
+    if not fast_tables.use_legacy_root_finder() \
+            and isinstance(M, (int, float)) == True \
+            and rho_central_param != 0:
+        return _ax_halo_mass_smooth(M, cosmo_dic, power_spec_dic,
+                                        rho_central_param, hmcode_dic,
+                                        concentration_param, eta_given,
+                                        axion_dic)
     #distinguish whether M is an array or a scalar
     if isinstance(M, (int, float)) == True:
         r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'], cosmo_dic['Omega_m_0'],
@@ -320,19 +396,95 @@ def func_central_density_param(M, cosmo_dic, power_spec_dic, concentration_param
             integral_NFW = MaxofMc(integral_NFW, axion_dic['beta1'], axion_dic['beta2'], cosmo_dic['z'], cosmo_dic['omega_m_0'], 
                                    c_frac, cosmo_dic['h'], cosmo_dic['m_ax'], cosmo_dic['version'], axion_dic['M_cut'], no_cut = True)
             guess = integral_NFW / integral_soliton
-            
+
             #find the central density parameter
             def func_find_root(dens):
                 return func_ax_halo_mass(m, cosmo_dic, power_spec_dic, dens, hmcode_dic, concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic) - MaxofMc(m, axion_dic['beta1'], axion_dic['beta2'], cosmo_dic['z'], cosmo_dic['omega_m_0'], c_frac, cosmo_dic['h'], cosmo_dic['m_ax'], cosmo_dic['version'], axion_dic['M_cut'])
+
+            # VM-SPEEDUP BEGINS (aggressive mode: bracketed solver)
+            #
+            # Legacy mode (below, upstream verbatim) solves M_ax(rho_c) =
+            # M_a(M_c) with scipy.optimize.root's unbracketed hybr method,
+            # accepts sol.x without a success check, and declares "no
+            # soliton" through the proxy |guess - rho_c| > 100 — an absolute
+            # threshold that in practice catches hybr failures rather than
+            # physics. Both quirks are part of the released, calibrated
+            # model, so they are preserved bit-faithfully behind
+            # legacy_root_finder: true (the path the fork_validate gate
+            # certifies against upstream).
+            #
+            # The default solver exploits the structure of the equation:
+            # M_ax(rho_c) grows monotonically with rho_c but is not
+            # continuous — at the amplitude where a soliton/NFW crossing is
+            # first detected, M_ax jumps by the mass of the NFW envelope.
+            # Targets inside that jump are exactly unreachable: no rho_c
+            # satisfies the equation. Upstream's hybr lands near the jump
+            # and the |guess - rho_c| < 100 test silently accepts the
+            # closest-achievable amplitude (with an integrated mass that is
+            # off by up to the jump); rejecting such halos instead is not
+            # an option, because func_axion_param_dic deletes zero-density
+            # halos from the M_int integration grid, and interior holes in
+            # that grid corrupt every downstream mass integral (measured:
+            # frac_cluster diverging to -1e5 and NaN boosts).
+            #
+            # The default solver therefore makes upstream's implicit
+            # behavior explicit and deterministic: a sign-change bracket is
+            # expanded geometrically around the upstream guess, brentq
+            # converges guaranteed (steps included — bracketing does not
+            # care), a residual test classifies the outcome, and
+            # closest-achievable amplitudes are accepted with the count
+            # reported in cosmo_dic['_vm_agg_diag'] ('solved' = residual
+            # < 1e-6; 'gap_target' = unreachable target, amplitude at the
+            # discontinuity accepted; 'no_bracket' = no soliton regime
+            # found, halo zeroed like upstream's genuine rejections). The
+            # objective is the smooth-within-branch default-mode M_ax
+            # (interpolated crossover cell, see _ax_halo_mass_smooth).
+            from cosmology import fast_tables as _ft
+            if not _ft.use_legacy_root_finder():
+                diag = cosmo_dic.setdefault(
+                    '_vm_agg_diag',
+                    {'solved': 0, 'no_bracket': 0, 'gap_target': 0})
+                target = MaxofMc(m, axion_dic['beta1'], axion_dic['beta2'],
+                                 cosmo_dic['z'], cosmo_dic['omega_m_0'],
+                                 c_frac, cosmo_dic['h'], cosmo_dic['m_ax'],
+                                 cosmo_dic['version'], axion_dic['M_cut'])
+                if not target > 0:
+                    dens_param_arr.append(0.)
+                    continue
+                lo, hi = guess / 4.0, guess * 4.0
+                flo, fhi = func_find_root(lo), func_find_root(hi)
+                n_lo = 0
+                while flo > 0 and n_lo < 20:
+                    lo /= 4.0
+                    flo = func_find_root(lo)
+                    n_lo += 1
+                n_hi = 0
+                while fhi < 0 and n_hi < 20:
+                    hi *= 4.0
+                    fhi = func_find_root(hi)
+                    n_hi += 1
+                if flo > 0 or fhi < 0:
+                    diag['no_bracket'] += 1
+                    dens_param_arr.append(0.)
+                    continue
+                dens = optimize.brentq(func_find_root, lo, hi,
+                                       rtol=1e-10, maxiter=200)
+                if abs(func_find_root(dens)) / target < 1e-6:
+                    diag['solved'] += 1
+                else:
+                    diag['gap_target'] += 1
+                dens_param_arr.append(float(dens))
+                continue
+            # VM-SPEEDUP ENDS
             dens_param = optimize.root(func_find_root, x0 = guess).x
-            
+
             #sometimes the solution is not really a solution,
             #so set than the central density paameter to zero, ie so solution can be found
             if np.abs(guess - dens_param) > 100:
                 dens_param_arr.append(0.)
             else:
                 dens_param_arr.append(float(dens_param))
-                
+
         return dens_param_arr
 
 

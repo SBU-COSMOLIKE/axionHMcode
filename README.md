@@ -90,6 +90,14 @@ every change site):
   option here; running the same setup at 1 and 2 is the convergence check.
   The radial 2000-point grid is deliberately excluded from the scaling (see
   appendix section A.7).
+- default solver (appendix A.12; released behavior behind
+  `legacy_root_finder: true`): the re-engineered soliton central-density
+  machinery — bracketed brentq with
+  residual classification and per-evaluation diagnostics instead of
+  unbracketed hybr with the |guess - rho_c| > 100 net, plus a continuous
+  crossover-cell correction. Results are not bit-comparable to upstream;
+  dome-version agreement is <= 7e-5 anyway, and the mode's diagnostics
+  exposed silent upstream solver failures in the basic version (A.12).
 
 Validation against unmodified upstream (commit a85ba26): nonlinear boost
 grids B(k,z) agree to max |dB/B| = 1.6e-5 across dome/basic, z = 0/2, three
@@ -465,8 +473,8 @@ A.1):
 
 Per likelihood evaluation in the AxiECAMB boost pipeline (~50 redshifts),
 the dome cost drops from ~135 s (upstream) to ~17 s, before the boost
-theory's `processes` fork-parallelism divides the wall time (default:
-one worker per `OMP_NUM_THREADS` core).
+theory's z-loop fork parallelism divides the wall time (always one worker
+per `OMP_NUM_THREADS` core; the environment's budget is never overridden).
 
 The outsized LCDM-limit ratio deserves a note, because it looks anomalous.
 Profiled, upstream's LCDM path spends ~75% of its time in one
@@ -487,17 +495,84 @@ are warm-cache marginal costs: a fresh cosmology pays a one-time ~0.1 s
 growth/G table build per worker process, amortized to ~2 ms per redshift
 over the pipeline's ~50-node grid.
 
-### A.11 What was deliberately not changed
+### A.11 What is not changed in strict mode
 
-- The soliton central-density solver still uses `scipy.optimize.root` with
-  upstream's initial guess and its rejection heuristic (solutions with
-  $|{\rm guess} - \rho_c| > 100$ are declared unphysical and set to zero).
-  Replacing the solver would change which halos are assigned a soliton —
-  behavior, not precision — and needs a physics decision, not an
-  optimization. The same reasoning pinned the radial grid in A.7/A.8. Its
-  guess-construction integrals (`integrate.quad`/`integrate.simpson` in
-  `func_central_density_param`) are likewise untouched: once per mass,
-  negligible cost, and they feed the rejection threshold.
-- The input k grid is never thinned or resampled: the boost is evaluated on
-  the transfer grid it receives (halving that grid was measured to corrupt
-  the boost by 11% through the $\sigma(M)$ integrals).
+- In strict mode (the default) the soliton central-density solver uses
+  `scipy.optimize.root` with upstream's initial guess and its rejection
+  heuristic (solutions with $|{\rm guess} - \rho_c| > 100$ are declared
+  unphysical and set to zero), bit-faithfully. Replacing the solver changes
+  which halos are assigned a soliton — behavior, not precision — so the
+  re-engineered solver lives behind the explicit `aggressive_optimization`
+  flag (A.12), with the strict path preserved verbatim. The same reasoning
+  pinned the radial grid in A.7/A.8. The guess-construction integrals
+  (`integrate.quad`/`integrate.simpson` in `func_central_density_param`)
+  are untouched in both modes: once per mass, negligible cost, and the
+  guess seeds both solvers.
+- The input k grid is never thinned or resampled in either mode: the boost
+  is evaluated on the transfer grid it receives (halving that grid was
+  measured to corrupt the boost by 11% through the $\sigma(M)$ integrals).
+
+### A.12 The default solver and the `legacy_root_finder` flag (round 4)
+
+The re-engineered soliton solver described here is the default (PI
+decision, 2026-07-03, after the validation evidence below); the released
+code's verbatim behavior is preserved behind `legacy_root_finder: true` —
+a yaml option of the boost theory, forwarded to the fork like
+`accuracy_boost` (`fast_tables.set_legacy_root_finder`), displayed
+explicitly in the example yamls, recorded in every chain's `updated.yaml`,
+and required to be constant within a chain. The legacy path is what the
+A.10 gate certifies against upstream, and it is the only mode a plain
+upstream checkout supports (the boost theory hard-errors if the default
+solver is requested without the fork).
+
+**What the default solver changes.** (i) The soliton central-density equation
+$M_{\rm ax}(\rho_c) = M_a(M_c)$ is solved by geometric bracket expansion
+around the upstream guess plus `brentq` — guaranteed, tolerance-controlled
+convergence — instead of unbracketed `hybr` with no success check. (ii) A
+residual test classifies every outcome, counted per evaluation in
+`cosmo_dic['_vm_agg_diag']`: `solved` (residual $< 10^{-6}$), `gap_target`
+(unreachable target, see below; the closest-achievable amplitude is
+accepted), `no_bracket` (no soliton regime found; halo zeroed). (iii) The
+objective is made smooth within branches by the interpolated crossover-cell
+correction of `_ax_halo_mass_aggressive` (log-linear crossing radius,
+two-piece trapezoid cell split).
+
+**What the investigation found** (the reason the mode exists):
+
+1. $M_{\rm ax}(\rho_c)$ is discontinuous by construction: at the amplitude
+   where a soliton/NFW crossing is first detected, the integral jumps by
+   the mass of the NFW envelope. Targets inside the jump are exactly
+   unreachable — for the dome Gaughan case at $z=0$, 33 of 100 halos.
+   Upstream's hybr lands near the jump and its distance-from-guess test
+   silently accepts the closest-achievable amplitude (integrated mass off
+   by up to the jump). Rejecting such halos instead is not an option:
+   `func_axion_param_dic` deletes zero-density halos from the `M_int`
+   integration grid, and interior holes in that grid corrupt every
+   downstream mass integral (measured before the gap-target acceptance was
+   adopted: `frac_cluster` diverging to $-1.3\times10^5$ and NaN boosts).
+   Aggressive mode makes the closest-achievable acceptance explicit,
+   deterministic, and counted.
+2. In the basic version (inputfile cosmology, $z=2$), upstream's hybr
+   returns non-root amplitudes for 18 of 59 halos — the worst off by a
+   factor $3.5\times10^3$; the $>100$ rejection net is absolute while
+   $\rho_c \sim 10^{-5}$, so it filters essentially nothing — and rejects
+   5 halos that possess perfectly valid roots. Net effect on the clustered
+   fraction: 0.147 (upstream) vs 0.200 (aggressive). The flag-on
+   differences in basic-mode boosts (below) are upstream solver noise, not
+   aggressive-mode error.
+
+**Validation.** Flag off: byte-identical to the A.10 results (gate rerun
+after the round-4 code landed; pytest 4/4). Flag on, dome (the calibrated
+version): max $|\Delta B/B|$ vs upstream $\le 7.2\times10^{-5}$ across the
+validation cases — table-level agreement, now deterministic and
+diagnosable. Flag on, basic: up to $2.3\times10^{-2}$ at
+$k \gtrsim 10\,h$/cMpc, attributed to finding 2. Posterior-level: all 115
+accepted points of a real-likelihood micro-MCMC (Planck lite + lowl + DESI
+BAO + DES-Y5 SN + ACT DR6 lensing; dome version) re-evaluated with the
+default solver against the legacy-solver chain values: max
+$|\Delta\chi^2| = 2.8\times10^{-2}$, rms $5\times10^{-3}$ — far below
+statistical relevance, so chains under the two solvers are
+indistinguishable. Timing: aggressive dome is currently ~0.40-0.44 s per
+redshift, slightly slower than strict (bracket probing costs a few extra
+objective evaluations); the mode's value is robustness and
+diagnosability, not speed.
