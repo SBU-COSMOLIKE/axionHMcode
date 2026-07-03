@@ -386,7 +386,38 @@ def func_central_density_param(M, cosmo_dic, power_spec_dic, concentration_param
             def integrand_ax(x):
                 return func_dens_profile_ax(x, m, cosmo_dic, power_spec_dic, 1., hmcode_dic, concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)*x**2
 
-            integral_soliton = integrate.quad(integrand_ax, 0, r_c[idx])[0]
+            # VM-SPEEDUP BEGINS (default solver mode: vectorized guess
+            # integral)
+            #
+            # The integral below is the unit-amplitude soliton mass within
+            # the core radius: for scalar r with rho_central_param != 0,
+            # func_dens_profile_ax returns the soliton branch only, so the
+            # quad integrand is exactly func_rho_soliton(r; 1) * r^2 — a
+            # smooth analytic profile. Upstream evaluates it with adaptive
+            # scipy.integrate.quad, ~21 scalar profile calls per halo mass
+            # (~0.15 s per redshift in total), and its value feeds two
+            # places: the solver's starting guess, and — in legacy mode
+            # only — the |guess - rho_c| > 100 acceptance test.
+            #
+            # In the default solver mode the guess only seeds the bracket
+            # expansion; the root brentq converges to does not depend on
+            # it. The same integral is therefore evaluated here in one
+            # vectorized pass on the cached weight grid (~1e-6 relative
+            # agreement with quad — far more accuracy than a bracket seed
+            # needs). Legacy mode keeps the upstream quad verbatim, because
+            # there the guess value participates in the acceptance
+            # heuristic and must stay bit-identical.
+            from cosmology import fast_tables as _ftg
+            if not _ftg.use_legacy_root_finder():
+                r_g, w_g = _ftg.geom_simpson_grid(1e-15, r_c[idx],
+                                                  cosmo_dic)
+                soliton_unit = func_rho_soliton(r_g, m, cosmo_dic, 1.)
+                integral_soliton = float(np.dot(w_g,
+                                                soliton_unit * r_g**2))
+            else:
+                integral_soliton = integrate.quad(integrand_ax, 0,
+                                                  r_c[idx])[0]
+            # VM-SPEEDUP ENDS
 
             r_arr = np.geomspace(1e-15 , r_c[idx], 1000)
             integrand_cold = NFW_profile(m, r_arr, power_spec_dic['k'], power_spec_dic['power_cold'], cosmo_dic, hmcode_dic, cosmo_dic['Omega_db_0'], 
