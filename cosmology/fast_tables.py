@@ -71,6 +71,13 @@ _R_GRID_NODES = 2000          # radial nodes of the soliton mass integral
                               # (upstream's geomspace point count; the grid
                               # must match upstream exactly, see
                               # geom_simpson_grid)
+_FFTLOG_PAD = 4096            # padded FFT length for the profile transform:
+                              # a power of two (FFT-friendly small primes)
+                              # whose extra ~36 e-folds of back padding also
+                              # push the reciprocal k grid far below 1/r_vir
+_FFTLOG_BIAS = 0.9            # Mellin bias q, inside the j0 strip (0, 2)
+_FFTLOG_WINDOW = 0.25         # tapered fraction of Fourier modes (the
+                              # c_window of cosmolike's cfftlog)
 
 # global node-count multiplier, set from the boost theory's yaml
 # `accuracy_boost` option; 1.0 = the counts the fork was validated with.
@@ -217,6 +224,129 @@ def geom_simpson_grid(r_min, r_max, cosmo_dic):
     tab = (r, w)
     cache[key] = tab
   return tab
+
+
+def _mellin_j0(s):
+  """Mellin transform of the spherical Bessel function j0,
+      int_0^inf x^(s-1) j0(x) dx = 2^(s-2) sqrt(pi) Gamma(s/2) / Gamma((3-s)/2),
+  valid on the strip 0 < Re s < 2; evaluated via loggamma for complex s."""
+  from scipy.special import loggamma
+  return np.exp((s - 2.0) * np.log(2.0) + 0.5 * np.log(np.pi)
+                + loggamma(s / 2.0) - loggamma((3.0 - s) / 2.0))
+
+
+def fftlog_j0_grid(r_min, r_max, cosmo_dic):
+  """Everything k-independent for the FFTLog evaluation of
+
+      I(k) = int_{r_min}^{r_max} rho(r) r^2 j0(k r) dr
+           = int dr/r F(r) j0(k r),        F(r) = rho(r) r^3,
+
+  on the pinned upstream radial grid r = geomspace(r_min, r_max, n) (the
+  same nodes as geom_simpson_grid, so the profile composition is
+  bit-identical to upstream's; see that docstring for why the grid is
+  pinned). FFTLog (Hamilton 2000): on a log-uniform grid the biased samples
+  F(r_n) r_n^(-q) are Fourier-decomposed into power laws r^(q + i eta_m),
+  each of which transforms analytically through the Mellin kernel of j0, so
+  one forward and one inverse FFT yield I(k) on the reciprocal log-uniform
+  k grid — for every k at once. This is the same machinery as cosmolike's
+  cfftlog (cosmo2D.c) with the Bessel order fixed to zero, which removes
+  the per-multipole kernel loop entirely.
+
+  Edge treatment (validated in the round-3 prototype): the profile is
+  truncated at r_max where F is at its maximum, and a bare Fourier
+  representation integrates that jump O(dlnr) differently from Simpson
+  (~5e-3). The padding is therefore filled with the constant F(r_max) — a
+  continuous extension whose biased amplitude decays by e^(-36 q) ~ 1e-14
+  long before the periodic wrap — and the extension's exact contribution is
+  subtracted analytically,
+
+      int_{r_max}^inf F(r_max) j0(k r) dr/r
+          = F(r_max) [ sin(a)/a - Ci(a) ],   a = k r_max,
+
+  with Ci from scipy.special.sici (the same special function upstream uses
+  for the cold NFW k-space profile). Together with cubic interpolation of
+  I onto the target k (the k grid is uniform in ln k, and linear
+  interpolation of the oscillatory tail was the dominant residual), the
+  measured agreement with dense-Simpson-on-the-same-samples is
+  max |dI|/I(0) <= 5e-6 over k in [1e-4, 15] h/cMpc, insensitive to the
+  bias, window, and padded length (dev_scripts prototype scan).
+
+  Returns (r, ext_bias, kernel, lnk0, dlnr): the radial nodes, the biased
+  constant-extension row, the combined Mellin x phase x taper kernel, and
+  the reciprocal-grid geometry. Cached per grid in cosmo_dic ('_vm_'
+  convention). The Fourier-mode count is n_fft//2 + 1 with
+  n_fft = _FFTLOG_PAD (its loggamma evaluation is the dominant setup cost,
+  paid once per (mass, redshift) grid).
+  """
+  n = _R_GRID_NODES
+  n_fft = _FFTLOG_PAD
+  q = _FFTLOG_BIAS
+  cache = cosmo_dic.setdefault("_vm_fftlog_cache", {})
+  key = (n, n_fft, float(r_min), float(r_max))
+  tab = cache.get(key)
+  if tab is None:
+    r = np.geomspace(r_min, r_max, num=n)
+    dlnr = np.log(r[-1] / r[0]) / (n - 1)
+    r_full = r[0] * np.exp(np.arange(n_fft) * dlnr)
+    data_bias = r**(-q)
+    ext_bias = r_full[n:]**(-q)
+    m = np.arange(n_fft // 2 + 1)
+    eta = 2.0 * np.pi * m / (n_fft * dlnr)
+    lnk0 = -np.log(r_full[-1])            # k_j = e^{lnk0 + j dlnr}
+    kernel = (_mellin_j0(q + 1j * eta)
+              * np.exp(-1j * eta * (lnk0 + np.log(r[0]))))
+    m_cut = int((1.0 - _FFTLOG_WINDOW) * (len(m) - 1))
+    hi = m > m_cut
+    taper = np.ones(len(m))
+    taper[hi] = 0.5 * (1.0 + np.cos(np.pi * (m[hi] - m_cut)
+                                    / (len(m) - 1 - m_cut)))
+    kernel = np.conj(kernel * taper)      # conj once here, not per call
+    tab = (r, data_bias, ext_bias, kernel, lnk0, dlnr)
+    cache[key] = tab
+  return tab
+
+
+def fftlog_j0_eval(tab, rho, k_targets):
+  """I(k_targets) = int rho(r) r^2 j0(k r) dr from the grid machinery of
+  fftlog_j0_grid and the profile samples rho(r). Two FFTs plus the analytic
+  edge tail and a cubic interpolation in ln k (uniform grid, closed-form
+  4-point Lagrange weights)."""
+  from scipy.special import sici
+  r, data_bias, ext_bias, kernel, lnk0, dlnr = tab
+  n = len(r)
+  n_fft = n + len(ext_bias)
+  q = _FFTLOG_BIAS
+  F = rho * r**3
+  a = np.empty(n_fft)
+  a[:n] = F * data_bias
+  a[n:] = F[-1] * ext_bias                # continuous constant extension
+  # the target sum is Re sum_m c_m K_m e^{-2 pi i m j / N} = irfft of
+  # conj(c K) up to the 1/N convention; the cached kernel is conj(K), so
+  # only the rfft output needs conjugating here
+  b = np.conj(np.fft.rfft(a)) * kernel
+  I_grid = np.fft.irfft(b, n=n_fft)
+  # interpolation window around the targets (slice before the k^-q unbias
+  # and the sici tail so both run on ~a few hundred points, not 4096)
+  lnk_t = np.log(k_targets)
+  j0f = (lnk_t - lnk0) / dlnr             # fractional index on the k grid
+  jlo = max(int(np.floor(j0f.min())) - 2, 1)
+  jhi = min(int(np.ceil(j0f.max())) + 3, n_fft - 2)
+  js = np.arange(jlo - 1, jhi + 2)
+  k_win = np.exp(lnk0 + js * dlnr)
+  I_win = I_grid[js] * k_win**(-q)
+  aa = k_win * r[-1]
+  si, ci = sici(aa)
+  I_win -= F[-1] * (np.sin(aa) / aa - ci)
+  # 4-point Lagrange (cubic) interpolation on the uniform-ln k window
+  jf = j0f - (jlo - 1)                    # position within the window
+  i1 = np.clip(jf.astype(int), 1, len(js) - 3)
+  t = jf - i1
+  w0 = -t * (t - 1.0) * (t - 2.0) / 6.0
+  w1 = (t * t - 1.0) * (t - 2.0) / 2.0
+  w2 = -t * (t + 1.0) * (t - 2.0) / 2.0
+  w3 = t * (t * t - 1.0) / 6.0
+  return (w0 * I_win[i1 - 1] + w1 * I_win[i1] + w2 * I_win[i1 + 1]
+          + w3 * I_win[i1 + 2])
 
 
 def _sigma_fingerprint(PS, Omega_0):

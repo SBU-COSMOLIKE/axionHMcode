@@ -349,13 +349,70 @@ def func_dens_profile_ax_kspace(k, M, cosmo_dic, power_spec_dic, central_dens_pa
     #the kspace density profile is defined via
     # \rho(k) = 4*\pi* int_0^r_vir \rho(r) * r^2 * sin(kr)/kr dr
     M_ax = func_ax_halo_mass(M, cosmo_dic, power_spec_dic, central_dens_param, hmcode_dic, concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)
-    r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'], 
+    r_vir = func_r_vir(cosmo_dic['z'], M, cosmo_dic['Omega_ax_0'], cosmo_dic['Omega_db_0'],
                        cosmo_dic['Omega_m_0'], cosmo_dic['Omega_w_0'], cosmo_dic['G_a'], cosmo_dic['version'])
-    
-    #distinguish whether M is an array or a scalar
+
+    # VM-SPEEDUP BEGINS
+    #
+    # Quantity. The normalized k-space axion halo profile
+    #
+    #   u(k, M) = (4 pi / M_ax) int_0^{r_vir} rho_ax(r) r^2 sin(kr)/(kr) dr,
+    #
+    # the spherical Bessel j0 transform of the composed soliton + NFW
+    # profile, needed by the one-halo and cross terms of the halo model.
+    #
+    # Upstream evaluation. For each halo mass, the kernel sin(kr)/(kr) was
+    # materialized as a dense (n_k x 2000) outer-product array, multiplied
+    # by the profile, and reduced with scipy.integrate.simpson along r —
+    # an O(n_k * n_r) direct Hankel transform per mass, dominated by the
+    # ~2e6 transcendental evaluations of the kernel (measured ~0.38 s per
+    # redshift, ~45% of the fork's round-2 cost).
+    #
+    # Fork evaluation. FFTLog on the identical samples (fast_tables.
+    # fftlog_j0_grid / fftlog_j0_eval; the algorithm of cosmolike's cfftlog
+    # in cosmo2D.c with the Bessel order pinned to zero, so no per-k kernel
+    # loop exists at all): the log-uniform radial grid is exactly FFTLog's
+    # native format, and one forward + one inverse FFT per mass yield the
+    # transform at every k simultaneously in O(n_r log n_r). The radial
+    # samples, and hence the profile composition and its crossover
+    # snapping, are bit-identical to upstream's (the grid is pinned for
+    # the reasons documented at func_ax_halo_mass); only the reduction of
+    # those samples changes. The truncation edge at r_vir is handled by a
+    # continuous constant extension through the zero padding plus the
+    # analytic subtraction of its tail (closed form in Si/Ci — the same
+    # scipy.special.sici upstream uses for the cold NFW profile), and the
+    # padded length is a power of two both for FFT efficiency and to push
+    # the reciprocal k grid ~36 e-folds below 1/r_vir, covering every
+    # target k in one transform.
+    #
+    # Accuracy. Measured against upstream's dense-Simpson rule on the same
+    # samples: max |dI|/I(k->0) <= 2e-5 over k in [1e-4, 15] h/cMpc
+    # (dev_scripts prototype scan; insensitive to the bias, window, and
+    # padded length). End-to-end agreement is bounded by the fork
+    # validation gate max |dB/B| <= 1e-4 (dev_scripts/fork_validate.py).
+    from cosmology import fast_tables
+    k_arr = np.asarray(k, dtype=np.float64)
+    if isinstance(M, (int, float)) == True:
+        tab = fast_tables.fftlog_j0_grid(1e-15, r_vir, cosmo_dic)
+        rho_arr = func_dens_profile_ax(tab[0], M, cosmo_dic, power_spec_dic, central_dens_param, hmcode_dic,
+                                       concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)
+        return list(4 * np.pi * fast_tables.fftlog_j0_eval(tab, rho_arr, k_arr) / M_ax)
+    else:
+        dens_profile_kspace_arr = []
+        for idx, m in enumerate(M):
+            if M_ax[idx] == 0:
+                dens_profile_kspace_arr.append(list(np.zeros(len(k))))
+            else:
+                tab = fast_tables.fftlog_j0_grid(1e-15, r_vir[idx], cosmo_dic)
+                rho_arr = func_dens_profile_ax(tab[0], m, cosmo_dic, power_spec_dic, central_dens_param[idx], hmcode_dic,
+                                               concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic)
+                dens_profile_kspace_arr.append(
+                    list(4 * np.pi * fast_tables.fftlog_j0_eval(tab, rho_arr, k_arr) / M_ax[idx]))
+        return dens_profile_kspace_arr
+    # VM-SPEEDUP ENDS (upstream body, kept as the reference implementation)
     if isinstance(M, (int, float)) == True:
         r_arr = np.geomspace(1e-15, r_vir, num=2000)
-        dens_profile_arr = func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, central_dens_param, hmcode_dic, 
+        dens_profile_arr = func_dens_profile_ax(r_arr, M, cosmo_dic, power_spec_dic, central_dens_param, hmcode_dic,
                                                 concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic) \
                            * r_arr**2 * np.sin(np.outer(k, r_arr)) / np.outer(k, r_arr)
         return list(4 * np.pi * integrate.simpson(y=dens_profile_arr, x = r_arr, axis=-1) / M_ax)
@@ -367,10 +424,10 @@ def func_dens_profile_ax_kspace(k, M, cosmo_dic, power_spec_dic, central_dens_pa
                 dens_profile_kspace_arr.append(list(np.zeros(len(k))))
             else:
                 r_arr = np.geomspace(1e-15, r_vir[idx], num=2000)
-                dens_profile_arr = func_dens_profile_ax(r_arr, m, cosmo_dic, power_spec_dic, central_dens_param[idx], hmcode_dic, 
+                dens_profile_arr = func_dens_profile_ax(r_arr, m, cosmo_dic, power_spec_dic, central_dens_param[idx], hmcode_dic,
                                                         concentration_param=concentration_param, eta_given=eta_given, axion_dic=axion_dic) \
                                    * r_arr**2 * np.sin(np.outer(k, r_arr)) / np.outer(k, r_arr)
                 dens_kspace = list(4 * np.pi * integrate.simpson(y=dens_profile_arr, x = r_arr, axis=-1) / M_ax[idx] )
                 dens_profile_kspace_arr.append(dens_kspace)
-        
+
         return dens_profile_kspace_arr

@@ -75,6 +75,15 @@ every change site):
   instead of a scipy.integrate.simpson call — the integral becomes a dot
   product, removing ~60 us of per-call bookkeeping from the solver's
   ~3000 objective evaluations per redshift.
+- `halo_model/axion_density_profile.py`: `func_dens_profile_ax_kspace` (the
+  k-space profile needed by the one-halo and cross terms) evaluates the
+  spherical Bessel j0 transform with FFTLog on the identical radial samples
+  (`fast_tables.fftlog_j0_grid`/`fftlog_j0_eval`; the algorithm of
+  cosmolike's cfftlog with the Bessel order pinned to zero), replacing the
+  dense (n_k x 2000) sin(kr)/(kr) kernel array and its Simpson reduction —
+  two FFTs per mass instead of ~2e6 transcendental kernel evaluations. The
+  truncation edge is handled by a continuous constant extension plus an
+  analytic Si/Ci tail subtraction (appendix A.8).
 - `cosmology/fast_tables.py` also exposes `set_accuracy_boost(x)`: a single
   multiplier on the table node counts (default 1.0 = the counts validated
   below). The AxiECAMB boost theory forwards its yaml `accuracy_boost`
@@ -85,12 +94,13 @@ every change site):
 Validation against unmodified upstream (commit a85ba26): nonlinear boost
 grids B(k,z) agree to max |dB/B| = 1.6e-5 across dome/basic, z = 0/2, three
 cosmologies including the LCDM limit; growth-table primitives agree with the
-original quadratures to <= 1.6e-6. Measured single-redshift speedups: 4.9x
-(dome, z=0: 3.5 -> 0.73 s), 4.0x (basic, z=0), 2.4x (dome, z=2), 15-22x
-(LCDM path); the remaining cost is dominated by the soliton central-density
-root solver structure (`optimize.root` re-evaluating the full profile per
-iteration) and the (M,k) profile Fourier transform, untouched here because
-solver replacement changes the guess-based no-solution rejection behavior.
+original quadratures to <= 1.6e-6. Measured single-redshift speedups: ~8x
+(dome, z=0: 2.9-3.5 -> 0.34 s), ~7x (basic, z=0), ~4x (z=2), 16-24x (LCDM
+path) — a dome likelihood evaluation drops from ~135 s to ~17 s
+single-threaded. The remaining cost is dominated by the soliton
+central-density root solver structure (`optimize.root` re-evaluating the
+full profile per iteration), untouched because solver replacement changes
+the guess-based no-solution rejection behavior (appendix A.11).
 
 The complete mathematical and implementation documentation of every change,
 including the measured performance anatomy that motivated it and the
@@ -343,7 +353,74 @@ untouched: they run once per mass (negligible cost) and feed the
 $|{\rm guess} - \rho_c| > 100$ rejection heuristic, which must stay
 bit-identical to upstream.
 
-### A.8 The accuracy knob (`fast_tables.set_accuracy_boost`)
+### A.8 The profile Fourier transform via FFTLog (`func_dens_profile_ax_kspace`, `fast_tables.fftlog_j0_grid` / `fftlog_j0_eval`)
+
+The halo-model one-halo and cross terms need the normalized k-space profile
+
+$$\tilde u(k, M) = \frac{4\pi}{M_{\rm ax}} \int_0^{r_{\rm vir}}
+\rho_{\rm ax}(r)\, r^2\, \frac{\sin kr}{kr}\, dr,$$
+
+the spherical Bessel $j_0$ transform of the composed profile. Upstream
+materialized the kernel $\sin(kr)/(kr)$ as a dense $(n_k \times 2000)$
+outer-product array per halo mass and reduced it with Simpson — a direct
+$O(n_k n_r)$ Hankel transform whose ~$2\times10^6$ transcendental kernel
+evaluations per mass dominated the stage (~0.38 s per redshift, ~45% of the
+round-2 cost).
+
+FFTLog (Hamilton 2000) exploits that on a log-uniform grid — which the
+pinned `geomspace` grid already is — the biased samples
+$F(r_n) r_n^{-q}$, $F = \rho r^3$, decompose by FFT into power laws
+$r^{q+i\eta_m}$, each of which passes through $j_0$ analytically via the
+Mellin kernel
+
+$$\int_0^\infty x^{s-1} j_0(x)\, dx =
+2^{s-2}\sqrt{\pi}\;\frac{\Gamma(s/2)}{\Gamma((3-s)/2)}, \qquad 0 < {\rm Re}\,s < 2,$$
+
+so one forward and one inverse FFT deliver $I(k)$ on the reciprocal
+log-uniform k grid — every k at once. This is the algorithm of cosmolike's
+`cfftlog` (cosmo2D.c) with the Bessel order pinned to zero; the per-order
+kernel loop of the non-Limber case (their phase 2) does not exist here.
+The radial samples, and hence the profile composition and crossover
+snapping, are bit-identical to upstream's; only the reduction changes.
+
+Three details carry the accuracy (all established in the round-3 prototype
+scan, `dev_scripts`):
+
+1. **Edge treatment.** The profile truncates at $r_{\rm vir}$ where $F$ is
+   at its maximum; a bare Fourier representation integrates that jump
+   $O(\Delta\ln r)$ differently from Simpson (~$5\times10^{-3}$). The
+   padding is therefore filled with the constant $F(r_{\rm vir})$ — a
+   continuous extension whose biased amplitude decays by $e^{-36q}$ long
+   before the periodic wrap — and its exact tail is subtracted analytically:
+   $\int_{r_{\rm vir}}^\infty F(r_{\rm vir})\, j_0(kr)\, dr/r =
+   F(r_{\rm vir})\,[\sin a/a - {\rm Ci}(a)]$, $a = k r_{\rm vir}$, via
+   `scipy.special.sici` (the same special function upstream uses for the
+   cold NFW profile).
+2. **Padding** to $n_{\rm fft} = 4096$: a power of two (FFT-friendly small
+   primes — the cosmo2D.c line-4725 consideration) whose extra ~36 e-folds
+   simultaneously push the reciprocal k grid far below $1/r_{\rm vir}$, so
+   a single transform covers every target k down to $10^{-4}\,h$/cMpc.
+3. **Cubic interpolation** onto the target k (closed-form 4-point Lagrange
+   weights on the uniform $\ln k$ grid): linear interpolation of the
+   oscillatory tail was the dominant residual ($3\times10^{-5}$ →
+   $5\times10^{-6}$).
+
+Measured accuracy against upstream's dense-Simpson rule on the same
+samples: max $|\Delta I|/I(k\to0) \le 2\times10^{-5}$ over
+$k \in [10^{-4}, 15]\,h$/cMpc, insensitive to the bias $q$, the window,
+and the padded length. Cost: 0.11 ms per mass evaluation plus 0.36 ms
+per-grid setup (the loggamma evaluations of the Mellin kernel, cached in
+`cosmo_dic` per grid) — the stage drops from ~0.38 s to ~0.05 s per
+redshift. FFT count: 2 per mass, 200 per redshift, ~$10^4$ per likelihood
+evaluation; all share one padded length, so pocketfft's internal
+per-length twiddle cache plays the role of cosmo2D.c's static FFTW plans
+(rebuilt never, warmed once per worker process). The transforms are not
+additionally threaded: the boost theory's process-level fork over the
+redshift loop owns the core budget (one worker per `OMP_NUM_THREADS`
+core), and each FFT batch is ~5 ms — the same resource discipline as
+MPI x OpenMP on Cocoa.
+
+### A.9 The accuracy knob (`fast_tables.set_accuracy_boost`)
 
 All table node counts in A.2-A.4 are scaled by a single multiplier, set from
 the AxiECAMB boost theory's yaml option `accuracy_boost` (modeled on CAMB's
@@ -353,10 +430,11 @@ at `accuracy_boost: 1` and `2` and comparing boost grids measures the total
 internal-discretization error in one shot; measurement (dome, $z=0$): max
 $|\Delta B/B| = 0.7\!-\!1.1\times10^{-3}$ between the two, dominated by the
 halo-mass integration grid (also doubled by the option), with the tables of
-this fork contributing $\lesssim 2\times10^{-6}$. The radial 2000-point
-grid of A.7 is deliberately excluded from the scaling (see A.7).
+this fork contributing $\lesssim 2\times10^{-6}$ (measured unchanged after
+the A.8 round). The radial 2000-point grid of A.7/A.8 is deliberately
+excluded from the scaling (see A.7).
 
-### A.9 Validation protocol and results
+### A.10 Validation protocol and results
 
 The gate for every change: max $|\Delta B/B| \le 10^{-4}$ on the final
 nonlinear boost $B(k,z) = P_{\rm NL}/P_{\rm L}$ against unmodified upstream
@@ -369,39 +447,38 @@ processes, and compares the grids; a primitive-level check compares the A.2
 and A.3 tables against the original quadratures directly. The gate is what
 caught the Gauss-Legendre crossover flips of A.7 before they shipped.
 
-Results (all rounds, including A.7): max $|\Delta B/B| = 1.6\times10^{-5}$
-over all cases (deviations carried by the table interpolations — they were
-unchanged by the memoization round, proving A.6 exact); growth/G primitives
-$\le 1.6\times10^{-6}$; the AxiECAMB boost pytest suite passes against the
-fork. Measured warm single-redshift times (same machine as A.1):
+Results (all rounds, including A.7 and A.8): max
+$|\Delta B/B| = 1.6\times10^{-5}$ over all cases (deviations carried by the
+table interpolations — they were unchanged by the memoization round,
+proving A.6 exact, and unchanged again by the A.8 round); growth/G
+primitives $\le 1.6\times10^{-6}$; the AxiECAMB boost pytest suite passes
+against the fork. Measured warm single-redshift times (same machine as
+A.1):
 
 | case | upstream | fork | speedup |
 |---|---|---|---|
-| dome, z=0 | 3.5 s | 0.73 s | 4.9x |
-| basic, z=0 | 2.0 s | 0.49 s | 4.0x |
-| dome, z=2 | 1.8 s | 0.73 s | 2.4x |
-| basic, z=2 | 1.0 s | 0.48 s | 2.1x |
-| LCDM limit | 0.1 s | 0.006 s | 15-22x |
+| dome, z=0 | 2.9-3.5 s | 0.34 s | ~8x |
+| basic, z=0 | 1.6-2.0 s | 0.21 s | ~7x |
+| dome, z=2 | 1.4-1.8 s | 0.33 s | ~4x |
+| basic, z=2 | 0.8-1.0 s | 0.21 s | ~3.6x |
+| LCDM limit | 0.1 s | 0.005 s | 16-24x |
 
 Per likelihood evaluation in the AxiECAMB boost pipeline (~50 redshifts),
-the dome cost drops from ~135 s (upstream) to ~36 s, before the boost
+the dome cost drops from ~135 s (upstream) to ~17 s, before the boost
 theory's `processes` fork-parallelism divides the wall time (default:
 one worker per `OMP_NUM_THREADS` core).
 
-### A.10 What was deliberately not changed
+### A.11 What was deliberately not changed
 
 - The soliton central-density solver still uses `scipy.optimize.root` with
   upstream's initial guess and its rejection heuristic (solutions with
   $|{\rm guess} - \rho_c| > 100$ are declared unphysical and set to zero).
   Replacing the solver would change which halos are assigned a soliton —
   behavior, not precision — and needs a physics decision, not an
-  optimization. The same reasoning pinned the radial grid in A.7.
-- The (M,k) profile Fourier transform in the halo-model sums
-  (`func_dens_profile_kspace_ax` and the `integrate.simpson` calls in
-  `PS_nonlin_*`) is untouched (~0.4 s per redshift). Its integrands are
-  oscillatory in $k r$ and its grids feed no branch decisions, so a
-  weight-vector treatment in the style of A.7 is a possible next step, to
-  be revalidated through the A.9 gate.
+  optimization. The same reasoning pinned the radial grid in A.7/A.8. Its
+  guess-construction integrals (`integrate.quad`/`integrate.simpson` in
+  `func_central_density_param`) are likewise untouched: once per mass,
+  negligible cost, and they feed the rejection threshold.
 - The input k grid is never thinned or resampled: the boost is evaluated on
   the transfer grid it receives (halving that grid was measured to corrupt
   the boost by 11% through the $\sigma(M)$ integrals).
